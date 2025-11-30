@@ -9,49 +9,84 @@ from PIL import Image
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import SimpleITK as sitk
 from scipy.ndimage import map_coordinates
+import image_utils
+import pdb
 
+# Clean png files 
+prefixes = [
+    "ct_window",
+    "ct_slice_with_raypoint",
+    "ct_slice_HU_colormap"
+]
 
-def scatter3d_with_mesh_save(points, mesh, outfile="pc_world_with_mesh.png",
-                             pt_size=0.5, mesh_alpha=0.15, max_faces=50000,
-                             elev=20, azim=-60, dpi=200):
+cwd = Path(".")
+
+for f in cwd.iterdir():
+    if f.is_file() and f.suffix.lower() == ".png":
+        if any(f.name.startswith(p) for p in prefixes):
+            print(f"Deleting {f}")
+            f.unlink()  # deletes the file
+
+def display_ct_window(ct_volume, z_idx, x_idx, y_idx, window_size=20):
     """
-    Save a 3D view of points overlaid on the mesh.
-    - points: (N,3) array
-    - mesh:   open3d.geometry.TriangleMesh
-    - max_faces: randomly subsample triangles for speed if mesh is large
+    Display a zoomed window of CT slice with HU values overlaid.
+    
+    Parameters:
+    -----------
+    ct_volume : np.ndarray
+        3D CT volume with shape (Z, X, Y)
+    z_idx, x_idx, y_idx : int
+        Center coordinates of the window
+    window_size : int
+        Size of window to display (default 20x20)
     """
-    pts = np.asarray(points)
+    # Clamp indices
+    z_int = np.clip(z_idx, 0, ct_volume.shape[0] - 1)
+    x_int = np.clip(x_idx, 0, ct_volume.shape[1] - 1)
+    y_int = np.clip(y_idx, 0, ct_volume.shape[2] - 1)
+    
+    # Extract full slice (X, Y)
+    ct_slice = ct_volume[z_int, :, :]
+    
+    # Window bounds
+    #pdb.set_trace()
+    row_idx = y_int
+    col_idx = x_int
+    half_window = window_size // 2
+    row_start = max(0, row_idx - half_window)
+    row_end = min(ct_slice.shape[0], row_idx + half_window)
+    col_start = max(0, col_idx - half_window)
+    col_end = min(ct_slice.shape[1], col_idx + half_window)
+    
+    # Extract window
+    window = ct_slice[row_start:row_end, col_start:col_end]
 
-    V = np.asarray(mesh.vertices)
-    F = np.asarray(mesh.triangles)
+    fig, ax = plt.subplots(figsize=(10, 10))
 
-    # build triangle collection
-    tris = V[F]  # (M,3,3)
-    poly = Poly3DCollection(tris, facecolor=(0.7, 0.7, 0.7, mesh_alpha),
-                            edgecolor=(0.5, 0.5, 0.5, 0.2), linewidths=0.1)
+    # *** X on horizontal axis, Y on vertical axis ***
+    # extent = [xmin, xmax, ymin, ymax]
+    im = ax.imshow(
+        window,                
+        cmap='gray',
+        origin='lower',
+    )
 
-    fig = plt.figure(figsize=(7, 7))
-    ax = fig.add_subplot(111, projection='3d')
+    ax.set_title(f"CT slice z={z_int}, center (x={x_int}, y={y_int})")
+    ax.set_xlabel("X (voxel index)")
+    ax.set_ylabel("Y (voxel index)")
 
-    # mesh first, then points on top
-    ax.add_collection3d(poly)
-    ax.scatter(pts[:,0], pts[:,1], pts[:,2], s=pt_size, depthshade=False, c='r')
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("HU")
 
-    # equal aspect across both mesh + points
-    mins = np.minimum(pts.min(axis=0), V.min(axis=0))
-    maxs = np.maximum(pts.max(axis=0), V.max(axis=0))
-    centers = (mins + maxs) / 2.0
-    span = (maxs - mins).max() / 2.0 + 1e-9
-    ax.set_xlim(centers[0]-span, centers[0]+span)
-    ax.set_ylim(centers[1]-span, centers[1]+span)
-    ax.set_zlim(centers[2]-span, centers[2]+span)
+    # Mark the center point (using swapped axes)
+    ax.plot(half_window, half_window, 'b+', markersize=15, markeredgewidth=2)
 
-    ax.view_init(elev=elev, azim=azim)
-    ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
     plt.tight_layout()
-    plt.savefig(outfile, dpi=dpi, bbox_inches="tight")
+    out = f"ct_window_z{z_int}_x{x_int}_y{y_int}.png"
+    plt.savefig(out, dpi=150)
+    plt.show()
     plt.close(fig)
-    print(f"Saved {outfile}")
+    print(f"Saved {out}")
 
 
 def overlay_on_ct_slice(ct_volume, mesh, point_cloud, slice_idx, ct_spacing, 
@@ -71,24 +106,31 @@ def overlay_on_ct_slice(ct_volume, mesh, point_cloud, slice_idx, ct_spacing,
     # Extract CT slice based on axis
     if axis == 'axial':
         ct_slice = ct_volume[slice_idx, :, :]
-        slice_pos = slice_idx * ct_spacing[2] # convert pixel to mm 
+        slice_pos = slice_idx * ct_spacing[2]  # Z position in mm
         coord_idx = 2  # Z coordinate
+        extent = [0, ct_slice.shape[1]*ct_spacing[0],  # X range
+                  0, ct_slice.shape[0]*ct_spacing[1]]   # Y range
+        x_label, y_label = 'X (mm)', 'Y (mm)'
     elif axis == 'sagittal':
-        ct_slice = ct_volume[:, :, slice_idx]
-        slice_pos = slice_idx * ct_spacing[0]
-        coord_idx = 0  # X coordinate
+        ct_slice = ct_volume[:, :, slice_idx]  # (Z, Y) slice at X=slice_idx
+        slice_pos = slice_idx * ct_spacing[0]  # X position in mm
+        coord_idx = 0  # X coordinate (not 1!)
+        extent = [0, ct_slice.shape[1]*ct_spacing[1],  # Y range
+                  0, ct_slice.shape[0]*ct_spacing[2]]   # Z range
+        x_label, y_label = 'Y (mm)', 'Z (mm)'
     elif axis == 'coronal':
-        ct_slice = ct_volume[:, slice_idx, :]
-        slice_pos = slice_idx * ct_spacing[1] 
-        coord_idx = 1  # Y coordinate
+        ct_slice = ct_volume[:, slice_idx, :]  # (Z, X) slice at Y=slice_idx
+        slice_pos = slice_idx * ct_spacing[1]  # Y position in mm
+        coord_idx = 1  # Y coordinate (not 0!)
+        extent = [0, ct_slice.shape[1]*ct_spacing[0],  # X range
+                  0, ct_slice.shape[0]*ct_spacing[2]]   # Z range
+        x_label, y_label = 'X (mm)', 'Z (mm)'
     
     # Create figure
     fig, ax = plt.subplots(figsize=(12, 10))
     
     # Display CT slice
-    ax.imshow(ct_slice, cmap='gray', origin='lower', 
-              extent=[0, ct_slice.shape[1]*ct_spacing[0], 
-                     0, ct_slice.shape[0]*ct_spacing[1] if axis=='axial' else ct_slice.shape[0]*ct_spacing[2]])
+    ax.imshow(ct_slice, cmap='gray', origin='lower', extent=extent)
     
     # Project mesh vertices onto slice plane
     vertices = np.asarray(mesh.vertices)
@@ -99,35 +141,40 @@ def overlay_on_ct_slice(ct_volume, mesh, point_cloud, slice_idx, ct_spacing,
     for tri in triangles:
         tri_verts = vertices[tri]
         if axis == 'axial':
-            if np.any(np.abs(tri_verts[:, 2] + slice_pos) < tolerance): # this makes sense since tri_verts is negative, and slice_pos is positive
-                coords = tri_verts[:, [0, 1]] # get x and y of the triangle
-                ax.plot(-coords[:, 0], -coords[:, 1], 'b-', linewidth=0.5, alpha=0.6)
+            # Check if triangle intersects Z plane
+            if np.any(np.abs(tri_verts[:, 2] + slice_pos) < tolerance):
+                ax.plot(-tri_verts[:, 0], -tri_verts[:, 1], 'b-', linewidth=0.5, alpha=0.6)
         elif axis == 'sagittal':
+            # Check if triangle intersects X plane
             if np.any(np.abs(tri_verts[:, 0] + slice_pos) < tolerance):
-                coords = tri_verts[:, [1, 2]]
-                ax.plot(-coords[:, 0], -coords[:, 1], 'b-', linewidth=0.5, alpha=0.6)
+                ax.plot(-tri_verts[:, 1], tri_verts[:, 2] + 159.103, 'b-', linewidth=0.5, alpha=0.6)
         elif axis == 'coronal':
+            # Check if triangle intersects Y plane
             if np.any(np.abs(tri_verts[:, 1] + slice_pos) < tolerance):
-                coords = tri_verts[:, [0, 2]]
-                ax.plot(-coords[:, 0], -coords[:, 1], 'b-', linewidth=0.5, alpha=0.6)
+                ax.plot(-tri_verts[:, 0], tri_verts[:, 2] + 159.103, 'b-', linewidth=0.5, alpha=0.6)
     
     # Project point cloud onto slice
     if axis == 'axial':
-        pc_mask = np.abs(point_cloud[:, 2] + slice_pos) < tolerance # makes sense since point_cloud is negative, and slice_pos is positive
+        pc_mask = np.abs(point_cloud[:, 2] + slice_pos) < tolerance
         pc_proj = point_cloud[pc_mask][:, [0, 1]]
+        if len(pc_proj) > 0:
+            ax.scatter(-pc_proj[:, 0], -pc_proj[:, 1], c='red', s=2, alpha=0.8, label='Point Cloud')
     elif axis == 'sagittal':
         pc_mask = np.abs(point_cloud[:, 0] + slice_pos) < tolerance
         pc_proj = point_cloud[pc_mask][:, [1, 2]]
+        if len(pc_proj) > 0:
+            ax.scatter(-pc_proj[:, 0], pc_proj[:, 1] + 159.103, c='red', s=2, alpha=0.8, label='Point Cloud')
     elif axis == 'coronal':
         pc_mask = np.abs(point_cloud[:, 1] + slice_pos) < tolerance
         pc_proj = point_cloud[pc_mask][:, [0, 2]]
+        if len(pc_proj) > 0:
+            ax.scatter(-pc_proj[:, 0], pc_proj[:, 1] + 159.103, c='red', s=2, alpha=0.8, label='Point Cloud')
     
-    if len(pc_proj) > 0:
-        ax.scatter(-pc_proj[:, 0], -pc_proj[:, 1], c='red', s=2, alpha=0.8, label='Point Cloud')
+    
     
     ax.set_title(f'{axis.capitalize()} Slice {slice_idx} - Mesh (blue) & Points (red)')
-    ax.set_xlabel('X (mm)' if axis != 'sagittal' else 'Y (mm)')
-    ax.set_ylabel('Y (mm)' if axis == 'axial' else 'Z (mm)')
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
     ax.legend()
     
     plt.tight_layout()
@@ -135,8 +182,19 @@ def overlay_on_ct_slice(ct_volume, mesh, point_cloud, slice_idx, ct_spacing,
     plt.close()
     print(f"Saved {output_file}")
 
-    
 
+def world_to_ct(P_world_xyz, origin, ct_spacing):
+    """Convert world points assumed RAS to CT LPS coordinates (mm)."""
+    P = np.asarray(P_world_xyz, float).reshape(-1, 3) 
+    P = P - origin
+    P = P / ct_spacing
+    return np.array([P[:, 2], -P[:, 0], -P[:, 1]]) # z, x, y
+
+def world_to_ct_row_idx(P_world_xyz, origin, ct_spacing):
+    P = np.asarray(P_world_xyz, float).reshape(-1, 3) 
+    P = P - origin
+    P = P / ct_spacing
+    return np.array([P[:, 2], -P[:, 1], -P[:, 0]]) # z, y, x
 
 # ==================== MAIN CODE ====================
 
@@ -155,14 +213,10 @@ cy = intrinsic_matrix[1][2]
 width, height = 1920, 1080
 intrinsics = o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
 
+# Mesh render
 render = o3d.visualization.rendering.OffscreenRenderer(width, height)
 render.scene.set_background([0, 0, 0, 0])
 render.scene.add_geometry("segmentation", mesh, o3d.visualization.rendering.MaterialRecord())
-
-# Load mask
-mask_img = Image.open(patient01_datapath + "undistorted_mask.bmp").convert("L")
-mask = np.array(mask_img)
-binary_mask = (mask > 0).astype(np.uint8)
 
 # load CT (SimpleITK returns physical LPS, mm; intensities already in HU)
 reader = sitk.ImageSeriesReader()
@@ -171,114 +225,213 @@ reader.SetFileNames(files)
 ct_img = reader.Execute()
 ct_volume = sitk.GetArrayFromImage(ct_img) 
 
-
+# CT metadata
 origin    = np.array(ct_img.GetOrigin(), dtype=float)       # (ox,oy,oz)
-spacing   = np.array(ct_img.GetSpacing(), dtype=float)      # (sx,sy,sz)
+ct_spacing   = np.array(ct_img.GetSpacing(), dtype=float)      # (sx,sy,sz)
 direction = np.array(ct_img.GetDirection(), dtype=float).reshape(3,3)
 
-print(f"CT shape (Z,Y,X): {ct_volume.shape}")
-print("CT origin (mm):", origin, "spacing (mm):", spacing)
-print("CT direction:\n", direction)
-
-# fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-# axes[0].imshow(ct_volume[ct_volume.shape[0]//4, :, :], cmap='gray')
-# axes[1].imshow(ct_volume[ct_volume.shape[0]//2, :, :], cmap='gray')
-# axes[2].imshow(ct_volume[ct_volume.shape[0]//8, :, :], cmap='gray')
-# plt.savefig("ct_slices.png", dpi=150, bbox_inches='tight')
-# plt.close()
-
-# Define CT spacing
-slice_thickness = 0.833  
-pixel_spacing = 0.415    
-ct_spacing = np.array([pixel_spacing, pixel_spacing, slice_thickness])
+# print(f"CT shape (Z,Y,X): {ct_volume.shape}")
+# print("CT origin (mm):", origin, "spacing (mm):", ct_spacing)
+# print("CT direction:\n", direction)
 
 for img_name in os.listdir(patient01_datapath + "correspondences/"):
     
-    extrinsic_matrix_w_to_c = np.array(p01_json_data["poses"][img_name[7:]])  
-    
-    # For rendering, setup_camera expects C→W transform
-    extrinsic_matrix_c_to_w = np.linalg.inv(extrinsic_matrix_w_to_c)
-    render.setup_camera(intrinsics, extrinsic_matrix_c_to_w)
+    extrinsic_matrix_c_to_w = np.array(p01_json_data["poses"][img_name[7:]])  
+    extrinsic_matrix_w_to_c = np.linalg.inv(extrinsic_matrix_c_to_w)
 
+    render.setup_camera(intrinsics, extrinsic_matrix_w_to_c)
+
+    # Pixels range from 0 (near plane) to 1 (far plane). If z_in_view_space is set to True then pixels are pre-transformed into view space (i.e., distance from camera).
     depth_image = np.asarray(render.render_to_depth_image(z_in_view_space = True))
-
-    # Apply mask
-    depth_image_masked = np.where(binary_mask, depth_image, 0)
-    
-    # Visualization
-
-    # circle = (depth_image_masked > 0)
-    # dmin, dmax = depth_image[circle].min(), depth_image[circle].max()
-    # normalized_depth = np.zeros_like(depth_image)
-    # normalized_depth[circle] = (depth_image_masked[circle] - dmin) / (dmax - dmin)
-    # plt.imsave(f"depth_image_{img_name[7:-4]}.png", normalized_depth, cmap="gray")
-
     depth_img_obj = o3d.geometry.Image(depth_image.astype(np.float32))
     
+    # pc_world is in world coordinate system (extrinsic converts it to world)
     pc_world = o3d.geometry.PointCloud.create_from_depth_image(
-        depth_img_obj, intrinsics, extrinsic=extrinsic_matrix_c_to_w, depth_scale=1.0
+        depth_img_obj, intrinsics, extrinsic=extrinsic_matrix_w_to_c, depth_scale=1.0
     )
-    
-    print(f"\nProcessing {img_name}")
     pts = np.asarray(pc_world.points)
     
-    # scatter3d_with_mesh_save(
-    #     pts, mesh,
-    #     outfile=f"pc_world_with_mesh_{img_name[7:-4]}.png",
-    #     pt_size=0.5,     
-    #     mesh_alpha=0.18, 
-    #     max_faces=40000   
-    # )
-
-    voxel_coords_continuous = pts / ct_spacing
-    
+    # Initialize HU image obtained from CT volume at the point cloud coordinates
     hu_image = np.zeros((height, width), dtype=np.float32)
-
     hu_values = map_coordinates(
         ct_volume,
-        np.array([-voxel_coords_continuous[:, 2], # Negative sign to end up with positive indices
-                -voxel_coords_continuous[:, 0], 
-                -voxel_coords_continuous[:, 1]]),
+        world_to_ct_row_idx(pts, origin, ct_spacing),
         order=1, 
         mode='constant',
         cval=np.nan 
     )
-    #print(np.unique(hu_values))
+    print("Hu_values.shape", hu_values.shape)
     hu_image.ravel()[:] = hu_values
-    #plt.imsave(f"hu_values_{img_name[7:-4]}.png", hu_image)
+
+    midpoint_x = width // 2
+    midpoint_y = height // 2
+
+    midpoint_depth = depth_image[midpoint_y, midpoint_x]  # index image by row, column
+    hu_vals = []
+
+    depths = np.linspace(0, 1.4 * midpoint_depth, 40)
+
+
+    for i, z in enumerate(depths):
+        # Back-project pixel (midpoint_x, midpoint_y) at depth z
+        projection_point = image_utils.project_2d_to_3d(
+            midpoint_x,
+            midpoint_y,
+            z,
+            pose=extrinsic_matrix_w_to_c,
+            intrinsics=intrinsic_matrix,
+            world_to_camera=False  # For some reason it works with world_to_camera=False...?  
+        ).reshape(1, 3)  # (1, 3) world coords
+        projection_point_in_ct = world_to_ct(projection_point, origin, ct_spacing)
+        projection_point_in_ct = np.asarray(projection_point_in_ct).reshape(3, -1)
+
+        # Unpack continuous indices (z, x, y)
+        z_idx, x_idx, y_idx = projection_point_in_ct[:, 0]
+
+        in_bounds = (
+            0 <= z_idx < ct_volume.shape[0] and
+            0 <= y_idx < ct_volume.shape[1] and
+            0 <= x_idx < ct_volume.shape[2]
+        )
+
+        z_int = int(round(z_idx))
+        y_int = int(round(y_idx))
+        x_int = int(round(x_idx))
+        row_idx = y_int
+        col_idx = x_int
+
+        row_idx_point = np.array([[z_idx], [y_idx], [x_idx]])
+        #print(f"z={z}: idx=({z_idx}, {y_idx}, {x_idx}), in_bounds={in_bounds}")
+        #print("row_idx_point", row_idx_point)
+        #Sample HU at this point
+        hu_value_proj_pt = map_coordinates(
+            ct_volume,
+            row_idx_point,
+            order=1, 
+            mode='constant',
+            cval=np.nan 
+        )[0]  # scalar
+    
+        
+        #hu_value_proj_pt = ct_volume[z_int][x_int][y_int]
+        #hu_value_proj_pt = ct_volume[z_int][row_idx][col_idx]
+
+        #print("hu_value_proj_pt", hu_value_proj_pt)
+        hu_vals.append(hu_value_proj_pt)
+
+        # --- NEW: visualize the CT slice with the sampled point ---
+        if in_bounds and img_name[7:-4] == "00001994":
+            # Nearest voxel indices for visualization
+            z_int = int(round(z_idx))
+            y_int = int(round(y_idx))
+            x_int = int(round(x_idx))
+
+            # Clamp just in case rounding lands on edge
+            z_int = np.clip(z_int, 0, ct_volume.shape[0] - 1)
+            y_int = np.clip(y_int, 0, ct_volume.shape[1] - 1)
+            x_int = np.clip(x_int, 0, ct_volume.shape[2] - 1)
+
+            ct_slice = ct_volume[z_int, :, :]  # (X, Y)
+
+            display_ct_window(ct_volume, z_idx=z_int, x_idx=x_int, y_idx=y_int, window_size=100)
+
+            fig, ax = plt.subplots(figsize=(8, 8))
+
+            vmin, vmax = -1030, 1000 
+
+            im = ax.imshow(
+                ct_slice,
+                cmap='viridis',     # or 'jet', 'viridis', etc.
+                origin='lower',
+                vmin=vmin,
+                vmax=vmax
+            )
+            # Red dot at sampling point
+            ax.scatter(x_int, y_int, c='red', s=10, alpha=0.5)
+            ax.set_title(f"CT slice z_idx={z_int}, HU value reading={hu_value_proj_pt}")
+            ax.set_xlabel("x (voxel)")
+            ax.set_ylabel("y (voxel)")
+
+            # Add colorbar showing HU scale
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("HU (Hounsfield Units)")
+
+            out_slice_path = f"ct_slice_HU_colormap_{img_name[7:-4]}_{i:03d}.png"
+            plt.tight_layout()
+            plt.savefig(out_slice_path, dpi=150)
+            plt.close(fig)
+            print(f"Saved {out_slice_path}")
+        # -----------------------------------------------------------
+
+    #print(hu_vals)
+
+    plt.figure()
+    plt.plot(depths, hu_vals)
+    plt.axvline(x=midpoint_depth, color='red', linestyle='--', linewidth=2,
+                label=f'Midpoint Depth: {midpoint_depth:.2f}')
+    plt.xlabel('Depth (camera z)')
+    plt.ylabel('HU Value')
+    plt.title(f"hu_values_vs_depth_{img_name[7:-4]}.png")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"hu_values_vs_depth_{img_name[7:-4]}.png")
+    plt.close()
+
+
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Show the HU image
+    im = ax.imshow(hu_image, cmap='viridis', origin='lower')
+
+    # Add a colorbar that shows HU values
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("HU")
+
+    # Turn off axes if you want cleaner export
+    ax.axis('off')
+
+    # Save the figure instead of using imsave
+    outname = f"hu_values_{img_name[7:-4]}.png"
+    plt.savefig(outname, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    print(f"Saved {outname}")
     
     # ==================== NEW SANITY CHECK VISUALIZATIONS ====================
     
     # Single slice overlay at middle of CT volume
-    mid_slice = ct_volume.shape[0] // 2
-    overlay_on_ct_slice(
-        ct_volume, 
-        mesh, 
-        pts,
-        slice_idx=mid_slice,
-        ct_spacing=ct_spacing,
-        axis='axial',
-        output_file=f'ct_overlay_axial_{img_name[7:-4]}.png'
-    )
+    # mid_slice = ct_volume.shape[0] // 2
+    # mid_slice_sagittal = int(ct_volume.shape[1]*0.75)
+    # mid_slice_coronal = ct_volume.shape[2] // 2
+    # overlay_on_ct_slice(
+    #     ct_volume, 
+    #     mesh, 
+    #     pts,
+    #     slice_idx=mid_slice,
+    #     ct_spacing=ct_spacing,
+    #     axis='axial',
+    #     output_file=f'ct_overlay_axial_{img_name[7:-4]}.png'
+    # )
 
-    overlay_on_ct_slice(
-        ct_volume, 
-        mesh, 
-        pts,
-        slice_idx=mid_slice,
-        ct_spacing=ct_spacing,
-        axis='sagittal',
-        output_file=f'ct_overlay_sagittal_{img_name[7:-4]}.png'
-    )
+    # overlay_on_ct_slice(
+    #     ct_volume, 
+    #     mesh, 
+    #     pts,
+    #     slice_idx=mid_slice_sagittal,
+    #     ct_spacing=ct_spacing,
+    #     axis='sagittal',
+    #     output_file=f'ct_overlay_sagittal_{img_name[7:-4]}.png'
+    # )
 
-    overlay_on_ct_slice(
-        ct_volume, 
-        mesh, 
-        pts,
-        slice_idx=mid_slice,
-        ct_spacing=ct_spacing,
-        axis='coronal',
-        output_file=f'ct_overlay_sagittal_{img_name[7:-4]}.png'
-    )
+    # overlay_on_ct_slice(
+    #     ct_volume, 
+    #     mesh, 
+    #     pts,
+    #     slice_idx=mid_slice_coronal,
+    #     ct_spacing=ct_spacing,
+    #     axis='coronal',
+    #     output_file=f'ct_overlay_coronal_{img_name[7:-4]}.png'
+    # )
     
     print(f"Sanity check visualizations saved for {img_name}")
